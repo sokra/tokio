@@ -132,6 +132,81 @@ fn spawn_blocking_then_shutdown() {
     });
 }
 
+#[test]
+/// A task spawned while the only blocking thread runs its park callback must
+/// run without a wakeup, and park and unpark stay balanced through shutdown.
+fn spawn_blocking_during_park_callback() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+
+    loom::model(|| {
+        let parks = Arc::new(AtomicUsize::new(0));
+        let unparks = Arc::new(AtomicUsize::new(0));
+        let mut builder = crate::runtime::Builder::new_current_thread();
+        builder
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(7200)); // don't let the thread exit on its own
+        builder.before_blocking_park = Some({
+            let parks = parks.clone();
+            Arc::new(move || {
+                parks.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        builder.after_blocking_unpark = Some({
+            let unparks = unparks.clone();
+            Arc::new(move || {
+                unparks.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let rt = builder.build().unwrap();
+        let rt_hdl = rt.handle().clone();
+
+        let jh0 = rt_hdl.spawn_blocking(|| {});
+        loom::future::block_on(jh0).unwrap();
+
+        // Races with the park callback of the blocking thread. If the thread
+        // missed it, this would wait until the keep-alive expires, which loom
+        // reports as a deadlock.
+        let jh1 = rt_hdl.spawn_blocking(|| {});
+        loom::future::block_on(jh1).unwrap();
+
+        drop(rt);
+        assert_eq!(parks.load(Ordering::SeqCst), unparks.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+/// Without a park callback, unpark is called when an idle thread is woken up.
+fn unpark_without_park() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+
+    loom::model(|| {
+        let unparks = Arc::new(AtomicUsize::new(0));
+        let mut builder = crate::runtime::Builder::new_current_thread();
+        builder
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(7200)); // don't let the thread exit on its own
+        builder.after_blocking_unpark = Some({
+            let unparks = unparks.clone();
+            Arc::new(move || {
+                unparks.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let rt = builder.build().unwrap();
+        let rt_hdl = rt.handle().clone();
+
+        let jh0 = rt_hdl.spawn_blocking(|| {});
+        loom::future::block_on(jh0).unwrap();
+        let jh1 = rt_hdl.spawn_blocking(|| {});
+        loom::future::block_on(jh1).unwrap();
+
+        drop(rt);
+        // The thread idles after the first task (unless it sees the second
+        // one before) and before shutdown.
+        let unparks = unparks.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&unparks), "{unparks}");
+    });
+}
+
 fn mk_runtime(num_threads: usize) -> Runtime {
     runtime::Builder::new_multi_thread()
         .worker_threads(num_threads)

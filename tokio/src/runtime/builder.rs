@@ -95,6 +95,12 @@ pub struct Builder {
     /// To run after each thread is unparked.
     pub(super) after_unpark: Option<Callback>,
 
+    /// To run before each blocking pool thread waits for new work.
+    pub(super) before_blocking_park: Option<Callback>,
+
+    /// To run after each blocking pool thread stops waiting for new work.
+    pub(super) after_blocking_unpark: Option<Callback>,
+
     /// To run before each task is spawned.
     pub(super) before_spawn: Option<TaskCallback>,
 
@@ -310,6 +316,10 @@ impl Builder {
             before_stop: None,
             before_park: None,
             after_unpark: None,
+
+            // No blocking pool thread callbacks
+            before_blocking_park: None,
+            after_blocking_unpark: None,
 
             before_spawn: None,
             after_termination: None,
@@ -845,6 +855,143 @@ impl Builder {
         F: Fn() + Send + Sync + 'static,
     {
         self.after_unpark = Some(std::sync::Arc::new(f));
+        self
+    }
+
+    /// Executes function `f` on a thread of the blocking pool just before it
+    /// waits for new work (goes idle).
+    ///
+    /// A thread of the blocking pool runs [`spawn_blocking`] tasks (and, for the
+    /// multi-thread runtime, the worker threads, which return to the blocking
+    /// pool when they hand off their worker, e.g. in [`block_in_place`]). When it
+    /// runs out of tasks, it waits until a new task arrives or until
+    /// [`thread_keep_alive`] expires, in which case the thread exits. `f` is
+    /// called once each time the thread runs out of tasks, before it starts
+    /// waiting. It is not called again on spurious wakeups.
+    ///
+    /// Unlike [`on_thread_park`], which only fires for the worker threads of the
+    /// scheduler, this fires for every thread of the blocking pool. It can be
+    /// used to release thread-local resources, e.g. to return memory cached by
+    /// the thread's allocator, while the thread is idle.
+    ///
+    /// `f` is called within the Tokio context and without holding any locks of
+    /// the blocking pool, so functions like
+    /// [`spawn_blocking`](crate::task::spawn_blocking) can be called. While `f`
+    /// runs, the thread does not count as idle: new tasks are given to other
+    /// threads, or wait in the queue until `f` returns and this thread picks
+    /// them up. A slow `f` can therefore delay tasks or cause additional threads
+    /// to be spawned.
+    ///
+    /// If [`on_blocking_thread_unpark`] is also used, every call of `f` is
+    /// followed by a call of that callback before the thread runs another task
+    /// or exits.
+    ///
+    /// Note: There can only be one blocking thread park callback for a runtime;
+    /// calling this function more than once replaces the last callback defined,
+    /// rather than adding to it.
+    ///
+    /// **Note**: This is an [unstable API][unstable]. The public API of this type
+    /// may break in 1.x releases. See [the documentation on unstable
+    /// features][unstable] for details.
+    ///
+    /// [unstable]: crate#unstable-features
+    /// [`spawn_blocking`]: crate::task::spawn_blocking
+    /// [`block_in_place`]: crate::task::block_in_place
+    /// [`thread_keep_alive`]: Self::thread_keep_alive
+    /// [`on_thread_park`]: Self::on_thread_park
+    /// [`on_blocking_thread_unpark`]: Self::on_blocking_thread_unpark
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// # use std::sync::Arc;
+    /// # use std::sync::atomic::{AtomicUsize, Ordering};
+    /// # use tokio::runtime;
+    /// # pub fn main() {
+    /// let parked = Arc::new(AtomicUsize::new(0));
+    ///
+    /// let runtime = runtime::Builder::new_multi_thread()
+    ///     .on_blocking_thread_park({
+    ///         let parked = parked.clone();
+    ///         move || {
+    ///             parked.fetch_add(1, Ordering::Relaxed);
+    ///         }
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// runtime.block_on(async {
+    ///     tokio::task::spawn_blocking(|| println!("Hello from a blocking thread!"))
+    ///         .await
+    ///         .unwrap();
+    /// });
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(all(not(loom), tokio_unstable))]
+    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+    pub fn on_blocking_thread_park<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.before_blocking_park = Some(std::sync::Arc::new(f));
+        self
+    }
+
+    /// Executes function `f` on a thread of the blocking pool just after it
+    /// stops waiting for new work.
+    ///
+    /// `f` is called once at the end of each period in which the thread was
+    /// idle: when the thread is woken up to run a new task, when its
+    /// [`thread_keep_alive`] expires before it exits, or when the runtime shuts
+    /// down. It does not require [`on_blocking_thread_park`] to be used. If it
+    /// is, every call of the park callback is followed by a call of `f`.
+    ///
+    /// `f` is called within the Tokio context and without holding any locks of
+    /// the blocking pool. Work in this callback delays the task the thread was
+    /// woken up for.
+    ///
+    /// Note: There can only be one blocking thread unpark callback for a
+    /// runtime; calling this function more than once replaces the last callback
+    /// defined, rather than adding to it.
+    ///
+    /// **Note**: This is an [unstable API][unstable]. The public API of this type
+    /// may break in 1.x releases. See [the documentation on unstable
+    /// features][unstable] for details.
+    ///
+    /// [unstable]: crate#unstable-features
+    /// [`thread_keep_alive`]: Self::thread_keep_alive
+    /// [`on_blocking_thread_park`]: Self::on_blocking_thread_park
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// # use tokio::runtime;
+    /// # pub fn main() {
+    /// let runtime = runtime::Builder::new_multi_thread()
+    ///     .on_blocking_thread_unpark(|| println!("blocking thread unparking"))
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// runtime.block_on(async {
+    ///     tokio::task::spawn_blocking(|| println!("Hello from a blocking thread!"))
+    ///         .await
+    ///         .unwrap();
+    /// });
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(all(not(loom), tokio_unstable))]
+    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+    pub fn on_blocking_thread_unpark<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.after_blocking_unpark = Some(std::sync::Arc::new(f));
         self
     }
 
@@ -1927,6 +2074,14 @@ impl fmt::Debug for Builder {
             .field("before_stop", &self.before_stop.as_ref().map(|_| "..."))
             .field("before_park", &self.before_park.as_ref().map(|_| "..."))
             .field("after_unpark", &self.after_unpark.as_ref().map(|_| "..."))
+            .field(
+                "before_blocking_park",
+                &self.before_blocking_park.as_ref().map(|_| "..."),
+            )
+            .field(
+                "after_blocking_unpark",
+                &self.after_blocking_unpark.as_ref().map(|_| "..."),
+            )
             .field(
                 "enable_eager_driver_handoff",
                 &self.enable_eager_driver_handoff,
