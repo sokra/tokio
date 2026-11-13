@@ -882,9 +882,9 @@ impl Builder {
     /// them up. A slow `f` can therefore delay tasks or cause additional threads
     /// to be spawned.
     ///
-    /// If [`on_blocking_thread_unpark`] is also used, every call of `f` is
-    /// followed by a call of that callback before the thread runs another task
-    /// or exits.
+    /// If [`on_blocking_thread_unpark`] is also used, that callback is called
+    /// before the thread runs tasks again. It is not called if the thread exits
+    /// instead.
     ///
     /// Note: There can only be one blocking thread park callback for a runtime;
     /// calling this function more than once replaces the last callback defined,
@@ -943,11 +943,12 @@ impl Builder {
     /// Executes function `f` on a thread of the blocking pool just after it
     /// stops waiting for new work.
     ///
-    /// `f` is called once at the end of each period in which the thread was
-    /// idle: when the thread is woken up to run a new task, when its
-    /// [`thread_keep_alive`] expires before it exits, or when the runtime shuts
-    /// down. It does not require [`on_blocking_thread_park`] to be used. If it
-    /// is, every call of the park callback is followed by a call of `f`.
+    /// `f` is called once each time a thread that ran out of tasks gets new
+    /// tasks, before it runs them: when it is woken up, or when tasks were
+    /// spawned while the park callback was running. It is not called when the
+    /// thread exits instead, i.e. when its [`thread_keep_alive`] expires or
+    /// when the runtime shuts down. It does not require
+    /// [`on_blocking_thread_park`] to be used.
     ///
     /// `f` is called within the Tokio context and without holding any locks of
     /// the blocking pool. Work in this callback delays the task the thread was

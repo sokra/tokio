@@ -134,7 +134,8 @@ fn spawn_blocking_then_shutdown() {
 
 #[test]
 /// A task spawned while the only blocking thread runs its park callback must
-/// run without a wakeup, and park and unpark stay balanced through shutdown.
+/// run without a wakeup. Each unpark follows a park, and the thread parks once
+/// more before it exits at shutdown.
 fn spawn_blocking_during_park_callback() {
     use loom::sync::atomic::{AtomicUsize, Ordering};
 
@@ -170,7 +171,10 @@ fn spawn_blocking_during_park_callback() {
         loom::future::block_on(jh1).unwrap();
 
         drop(rt);
-        assert_eq!(parks.load(Ordering::SeqCst), unparks.load(Ordering::SeqCst));
+        assert_eq!(
+            parks.load(Ordering::SeqCst),
+            unparks.load(Ordering::SeqCst) + 1
+        );
     });
 }
 
@@ -200,10 +204,10 @@ fn unpark_without_park() {
         loom::future::block_on(jh1).unwrap();
 
         drop(rt);
-        // The thread idles after the first task (unless it sees the second
-        // one before) and before shutdown.
+        // The thread unparks if it idled after the first task (unless it saw
+        // the second one before), but not at shutdown.
         let unparks = unparks.load(Ordering::SeqCst);
-        assert!((1..=2).contains(&unparks), "{unparks}");
+        assert!(unparks <= 1, "{unparks}");
     });
 }
 

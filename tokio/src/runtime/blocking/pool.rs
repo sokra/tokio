@@ -517,9 +517,6 @@ impl Inner {
         let mut join_on_thread = None;
         // is this thread currently counted in `num_idle_threads`?
         let mut is_counted_idle;
-        // has the thread parked (called `before_park` or started waiting for
-        // work) without calling `after_unpark` yet?
-        let mut is_parked;
 
         'main: loop {
             // BUSY
@@ -539,19 +536,17 @@ impl Inner {
                 // to this thread via a notification that it could miss.
                 drop(shared);
                 f();
-                is_parked = true;
                 shared = self.shared.lock();
 
                 if !shared.queue.is_empty() {
                     // A task was spawned while the callback was running. Run
                     // it right away instead of waiting for a notification.
-                    shared = self.unpark(shared, &mut is_parked);
+                    shared = self.unpark(shared);
                     continue 'main;
                 }
             }
 
             // IDLE
-            is_parked = true;
             self.metrics.inc_num_idle_threads();
             // mark this thread as currently counted in `num_idle_threads`.
             is_counted_idle = true;
@@ -588,9 +583,6 @@ impl Inner {
                 // Spurious wakeup detected, go back to sleep.
             }
 
-            // UNPARK
-            shared = self.unpark(shared, &mut is_parked);
-
             if shared.shutdown {
                 // Drain the queue
                 while let Some(task) = shared.queue.pop_front() {
@@ -604,6 +596,9 @@ impl Inner {
 
                 break;
             }
+
+            // UNPARK
+            shared = self.unpark(shared);
         }
 
         // Thread exit
@@ -627,13 +622,6 @@ impl Inner {
 
         drop(shared);
 
-        // The thread may have parked before its keep-alive timed out.
-        if is_parked {
-            if let Some(f) = &self.after_unpark {
-                f();
-            }
-        }
-
         if let Some(f) = &self.before_stop {
             f();
         }
@@ -643,15 +631,9 @@ impl Inner {
         }
     }
 
-    /// Calls `after_unpark` without holding the lock if the thread is parked.
-    fn unpark<'a>(
-        &'a self,
-        shared: MutexGuard<'a, Shared>,
-        is_parked: &mut bool,
-    ) -> MutexGuard<'a, Shared> {
-        if !std::mem::take(is_parked) {
-            return shared;
-        }
+    /// Calls `after_unpark` without holding the lock, before the thread runs
+    /// tasks again after parking.
+    fn unpark<'a>(&'a self, shared: MutexGuard<'a, Shared>) -> MutexGuard<'a, Shared> {
         match &self.after_unpark {
             Some(f) => {
                 drop(shared);

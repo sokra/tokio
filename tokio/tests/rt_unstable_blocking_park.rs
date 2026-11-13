@@ -89,8 +89,8 @@ fn wait_for_idle_blocking_pool(rt: &Runtime) {
     wait_until(|| metrics.num_idle_blocking_threads() == metrics.num_blocking_threads());
 }
 
-/// Every park is followed by an unpark before the thread runs another task or
-/// exits, and idle threads have parked.
+/// Every unpark follows a park, before the thread runs tasks again, and idle
+/// threads have parked. Threads don't unpark before they exit.
 #[test]
 fn park_and_unpark_are_balanced() {
     for mut builder in builders() {
@@ -130,16 +130,21 @@ fn park_and_unpark_are_balanced() {
 
         drop(rt);
 
-        // After shutdown, every thread that parked has unparked before it
-        // stopped, alternating park and unpark.
+        // After shutdown, every thread alternated park and unpark, and parked
+        // last before it stopped.
         assert!(recorder.count(Event::Park) >= task_threads.len());
         for id in recorder.threads() {
             let events = recorder.events_of(id);
             let (stop, park_unpark) = events.split_last().unwrap();
             assert_eq!(*stop, Event::Stop, "{events:?}");
-            assert_eq!(park_unpark.len() % 2, 0, "{events:?}");
-            for pair in park_unpark.chunks(2) {
-                assert_eq!(pair, [Event::Park, Event::Unpark], "{events:?}");
+            assert_eq!(park_unpark.last(), Some(&Event::Park), "{events:?}");
+            for (i, event) in park_unpark.iter().enumerate() {
+                let expected = if i % 2 == 0 {
+                    Event::Park
+                } else {
+                    Event::Unpark
+                };
+                assert_eq!(*event, expected, "{events:?}");
             }
         }
     }
@@ -170,9 +175,9 @@ fn park_runs_before_thread_is_idle() {
     }
 }
 
-/// A thread that parked unparks before it exits after its keep-alive expires.
+/// A thread whose keep-alive expires exits without unparking.
 #[test]
-fn unpark_on_keep_alive_timeout() {
+fn no_unpark_on_keep_alive_timeout() {
     for mut builder in builders() {
         let recorder = Recorder::default();
         recorder.install(&mut builder);
@@ -184,10 +189,7 @@ fn unpark_on_keep_alive_timeout() {
             .unwrap();
         wait_until(|| recorder.events_of(id).contains(&Event::Stop));
 
-        assert_eq!(
-            recorder.events_of(id),
-            [Event::Park, Event::Unpark, Event::Stop]
-        );
+        assert_eq!(recorder.events_of(id), [Event::Park, Event::Stop]);
     }
 }
 
@@ -271,7 +273,7 @@ fn task_spawned_during_park_callback_runs_promptly() {
 }
 
 /// The unpark callback also works without a park callback: it is called when an
-/// idle thread is woken up for a task, and before it exits.
+/// idle thread is woken up for a task, but not when it exits at shutdown.
 #[test]
 fn unpark_without_park() {
     for mut builder in builders() {
@@ -300,17 +302,14 @@ fn unpark_without_park() {
         wait_for_idle_blocking_pool(&rt);
 
         drop(rt);
-        assert_eq!(
-            recorder.events_of(id),
-            [Event::Unpark, Event::Unpark, Event::Stop]
-        );
+        assert_eq!(recorder.events_of(id), [Event::Unpark, Event::Stop]);
     }
 }
 
-/// Without a park callback, a thread whose keep-alive expires still unparks
-/// before it exits.
+/// Without a park callback, a thread whose keep-alive expires exits without
+/// unparking.
 #[test]
-fn unpark_without_park_on_keep_alive_timeout() {
+fn unpark_without_park_not_called_on_keep_alive_timeout() {
     for mut builder in builders() {
         let recorder = Recorder::default();
         let unpark = recorder.clone();
@@ -326,7 +325,7 @@ fn unpark_without_park_on_keep_alive_timeout() {
             .unwrap();
         wait_until(|| recorder.events_of(id).contains(&Event::Stop));
 
-        assert_eq!(recorder.events_of(id), [Event::Unpark, Event::Stop]);
+        assert_eq!(recorder.events_of(id), [Event::Stop]);
     }
 }
 
@@ -338,7 +337,8 @@ fn spawn_blocking_from_unpark_callback() {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(Some(tx));
         builder
-            .thread_keep_alive(Duration::from_millis(10))
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(60))
             .on_blocking_thread_unpark(move || {
                 if let Some(tx) = tx.lock().unwrap().take() {
                     task::spawn_blocking(move || tx.send(()).unwrap());
@@ -346,7 +346,9 @@ fn spawn_blocking_from_unpark_callback() {
             });
         let rt = builder.build().unwrap();
 
-        // The thread unparks when its keep-alive expires.
+        // The thread unparks when it is woken up for the second task.
+        rt.block_on(rt.spawn_blocking(|| {})).unwrap();
+        wait_for_idle_blocking_pool(&rt);
         rt.block_on(rt.spawn_blocking(|| {})).unwrap();
 
         rx.recv_timeout(TIMEOUT).unwrap();
@@ -367,19 +369,24 @@ fn callbacks_are_replaced() {
             }
         };
         builder
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(60))
             .on_blocking_thread_park(count(&replaced))
             .on_blocking_thread_park(count(&parks))
             .on_blocking_thread_unpark(count(&replaced))
             .on_blocking_thread_unpark(count(&unparks));
         let rt = builder.build().unwrap();
 
+        // The second task wakes up the idle thread.
+        rt.block_on(rt.spawn_blocking(|| {})).unwrap();
+        wait_for_idle_blocking_pool(&rt);
         rt.block_on(rt.spawn_blocking(|| {})).unwrap();
         wait_for_idle_blocking_pool(&rt);
         drop(rt);
 
         assert_eq!(replaced.load(Ordering::SeqCst), 0);
         assert!(parks.load(Ordering::SeqCst) > 0);
-        assert_eq!(parks.load(Ordering::SeqCst), unparks.load(Ordering::SeqCst));
+        assert!(unparks.load(Ordering::SeqCst) > 0);
     }
 }
 
